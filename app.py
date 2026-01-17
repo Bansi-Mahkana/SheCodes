@@ -1,90 +1,282 @@
-import sqlite3
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import plotly.express as px
+import sqlite3
+import os
 
-st.title("Smart City Health Risk Dashboard")
+# ---------------- PAGE CONFIG ----------------
+st.set_page_config(
+    page_title="Public Health Intelligence Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-@st.cache_data
-def load_data():
-    conn = sqlite3.connect("database/final.db")
-    df = pd.read_sql("SELECT * FROM derived_data", conn)
-    conn.close()
-    return df
+# ---------------- CUSTOM UI STYLE ----------------
+st.markdown("""
+<style>
+div[data-testid="metric-container"] {
+    background-color: #f5f7fa;
+    border-radius: 10px;
+    padding: 14px;
+    border-left: 6px solid #4c78a8;
+}
+</style>
+""", unsafe_allow_html=True)
 
-df = load_data()
+# ---------------- LOAD DATA ----------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "final.db")
 
-st.write(df.head())
+conn = sqlite3.connect(DB_PATH)
+df = pd.read_sql_query("SELECT * FROM health_data", conn)
+conn.close()
 
-st.sidebar.header("Filters")
+# ---------------- DATA CLEANING ----------------
+df.columns = df.columns.str.strip().str.lower()
+df["date"] = pd.to_datetime(df["date"])
+
+# ---------------- CITY COORDINATES ----------------
+city_coords = {
+    "Ahmedabad": (23.0225, 72.5714),
+    "Delhi": (28.6139, 77.2090),
+    "Mumbai": (19.0760, 72.8777),
+    "Bengaluru": (12.9716, 77.5946),
+    "Chennai": (13.0827, 80.2707)
+}
+
+df["lat"] = df["city"].map(lambda x: city_coords.get(x, (None, None))[0])
+df["lon"] = df["city"].map(lambda x: city_coords.get(x, (None, None))[1])
+
+# ---------------- FEATURE ENGINEERING ----------------
+df["respiratory_ratio"] = df["respiratory_cases"] / df["total_hospital_visits"]
+df["heat_ratio"] = df["heat_related_cases"] / df["total_hospital_visits"]
+
+df["health_risk_score"] = (
+    0.6 * df["respiratory_ratio"] +
+    0.4 * df["heat_ratio"]
+)
+
+def risk_level(score):
+    if score < 0.05:
+        return "Low"
+    elif score < 0.15:
+        return "Medium"
+    else:
+        return "High"
+
+df["risk_level"] = df["health_risk_score"].apply(risk_level)
+
+# ---------------- SIDEBAR FILTERS ----------------
+st.sidebar.header("🔍 Filters")
 
 city = st.sidebar.selectbox(
     "Select City",
-    df["city"].unique()
+    sorted(df["city"].unique())
+)
+# Default city comes from sidebar
+top_city = city
+
+date_range = st.sidebar.date_input(
+    "Select Date Range",
+    [df["date"].min(), df["date"].max()]
 )
 
-date = st.sidebar.selectbox(
-    "Select Date",
-    df[df["city"] == city]["date"].unique()
+filtered_df = df[
+    (df["city"] == top_city) &
+    (df["date"] >= pd.to_datetime(date_range[0])) &
+    (df["date"] <= pd.to_datetime(date_range[1]))
+].copy()
+
+
+# ---------------- TITLE ----------------
+
+
+st.title("🌍 Public Health Intelligence Dashboard")
+st.markdown(
+    "Data-driven insights for **urban health risk assessment** and **policy decision-making**."
 )
 
-row = df[
-    (df["city"] == city) &
-    (df["date"] == date)
-].iloc[0]
+# 🔍 City selector at top (UX improvement)
+top_city = st.selectbox(
+    "🔎 Search & Select City",
+    sorted(df["city"].unique()),
+    index=sorted(df["city"].unique()).index(city)
+)
 
-st.subheader(f"City: {city} | Date: {date}")
+st.markdown("---")
 
-st.write("Vehicle Count:", row["vehicle_count"])
-st.write("Average Speed:", row["avg_speed"])
-st.write("Temperature:", row["temperature"])
-st.write("AQI:", row["aqi"])
-st.write("Health Risk Score:", row["health_risk_score"])
-st.write("Risk Level:", row["risk_level"])
 
-c1, c2, c3, c4 = st.columns(4)
 
-c1.metric("🚗 Vehicles", row["vehicle_count"])
-c2.metric("⚡ Avg Speed", f"{row['avg_speed']} km/h")
-c3.metric("🌫️ AQI", row["aqi"])
-c4.metric("🏥 Respiratory Cases", row["respiratory_cases"])
+# ---------------- KPI METRICS ----------------
+st.subheader("📌 City Health Overview")
 
-st.subheader("Overall Health Risk")
+k1, k2, k3, k4 = st.columns(4)
 
-if row["risk_level"] == "Low":
-    st.success("🟢 LOW RISK")
-elif row["risk_level"] == "Medium":
-    st.warning("🟡 MEDIUM RISK")
+k1.metric("🏥 Avg Hospital Visits", int(filtered_df["total_hospital_visits"].mean()))
+k2.metric("🌬 Avg Respiratory Cases", int(filtered_df["respiratory_cases"].mean()))
+k3.metric("🔥 Avg Heat Cases", int(filtered_df["heat_related_cases"].mean()))
+k4.metric("⚠️ Risk Score", round(filtered_df["health_risk_score"].mean(), 3))
+
+# ---------------- RISK STATUS ----------------
+st.markdown("### ⚠️ Current Risk Status")
+
+risk_mode = filtered_df["risk_level"].mode()[0]
+
+if risk_mode == "Low":
+    st.success("🟢 LOW RISK — Conditions are stable")
+elif risk_mode == "Medium":
+    st.warning("🟡 MEDIUM RISK — Monitoring recommended")
 else:
-    st.error("🔴 HIGH RISK")
+    st.error("🔴 HIGH RISK — Immediate intervention required")
 
-st.write("Risk Score:", row["health_risk_score"])
+st.markdown("---")
 
-st.subheader("🚦 Traffic")
-st.write("Congestion Level:", row["congestion_level"])
+# ---------------- MAP ----------------
+st.subheader("🗺️ City Health Risk Map")
 
-st.subheader("🌦️ Weather")
-st.write("Temperature:", row["temperature"])
-st.write("Heat Index:", row["heat_index"])
-st.write("Humidity:", row["humidity"])
-st.write("Rainfall:", row["rainfall"])
+map_df = filtered_df.dropna(subset=["lat", "lon"])
 
-st.subheader("🏥 Health")
-st.write("Respiratory Cases:", row["respiratory_cases"])
-st.write("Heat-related Cases:", row["heat_related_cases"])
+fig_map = px.scatter_mapbox(
+    map_df,
+    lat="lat",
+    lon="lon",
+    size="health_risk_score",
+    color="risk_level",
+    hover_name="city",
+    hover_data={
+        "health_risk_score": True,
+        "respiratory_cases": True,
+        "heat_related_cases": True
+    },
+    zoom=6,
+    height=520
+)
 
-city_df = df[df["city"] == city]
-st.line_chart(city_df.set_index("date")["health_risk_score"])
+fig_map.update_layout(
+    mapbox_style="carto-positron",
+    margin=dict(l=0, r=0, t=30, b=0),
+    legend=dict(bgcolor="rgba(255,255,255,0.8)")
+)
 
-city_coords = {
-    "Delhi": [28.61, 77.21],
-    "Mumbai": [19.07, 72.87],
-    "Bangalore": [12.97, 77.59]
-}
+st.plotly_chart(fig_map, use_container_width=True)
 
-map_df = pd.DataFrame({
-    "lat": [city_coords[city][0]],
-    "lon": [city_coords[city][1]]
-})
+st.caption("💡 Higher bubble size and darker colors indicate elevated public health risk.")
 
-st.subheader("📍 City Location")
-st.map(map_df)
+st.markdown("---")
+
+# ---------------- VISUAL GRID ----------------
+st.subheader("📊 Health Analytics")
+
+col1, col2 = st.columns(2)
+
+# --- PIE: Risk Distribution ---
+risk_pie = filtered_df["risk_level"].value_counts().reset_index()
+risk_pie.columns = ["Risk Level", "Days"]
+
+fig_pie = px.pie(
+    risk_pie,
+    names="Risk Level",
+    values="Days",
+    hole=0.4,
+    title="Health Risk Distribution"
+)
+
+col1.plotly_chart(fig_pie, use_container_width=True)
+
+# --- LINE: Trends ---
+fig_trend = px.line(
+    filtered_df,
+    x="date",
+    y=["respiratory_cases", "heat_related_cases"],
+    title="Disease Trend Over Time"
+)
+
+col2.plotly_chart(fig_trend, use_container_width=True)
+
+st.markdown("---")
+
+# ---------------- BAR: DAILY LOAD ----------------
+st.subheader("🏥 Daily Hospital Load")
+
+fig_bar = px.bar(
+    filtered_df,
+    x="date",
+    y=["respiratory_cases", "heat_related_cases"],
+    title="Hospital Case Composition",
+    labels={"value": "Cases", "variable": "Case Type"}
+)
+
+st.plotly_chart(fig_bar, use_container_width=True)
+
+st.caption("💡 Respiratory cases contribute more consistently to hospital load.")
+
+st.markdown("---")
+
+# ---------------- WHAT-IF SCENARIO ----------------
+with st.expander("🔮 What-If Scenario: Heatwave Impact", expanded=True):
+
+    increase = st.slider(
+        "Increase Heat-Related Cases (%)",
+        0, 50, 10
+    )
+
+    filtered_df["simulated_heat"] = (
+        filtered_df["heat_related_cases"] * (1 + increase / 100)
+    )
+
+    fig_sim = px.line(
+        filtered_df,
+        x="date",
+        y=["heat_related_cases", "simulated_heat"],
+        title="Simulated Heatwave Scenario"
+    )
+
+    st.plotly_chart(fig_sim, use_container_width=True)
+
+    st.caption(
+        "Simulation highlights potential surge in healthcare burden during extreme heat events."
+    )
+
+# ---------------- ROLLING AVERAGE ----------------
+st.markdown("---")
+st.subheader("📉 Early Warning Indicator")
+
+filtered_df = filtered_df.sort_values("date")
+filtered_df["resp_7d_avg"] = filtered_df["respiratory_cases"].rolling(7).mean()
+
+fig_roll = px.line(
+    filtered_df,
+    x="date",
+    y="resp_7d_avg",
+    title="7-Day Rolling Average of Respiratory Cases"
+)
+
+st.plotly_chart(fig_roll, use_container_width=True)
+
+# ---------------- HEATMAP ----------------
+st.markdown("---")
+st.subheader("🔥 Weekly Risk Intensity Heatmap")
+
+filtered_df["week"] = filtered_df["date"].dt.isocalendar().week
+
+heatmap_df = (
+    filtered_df
+    .groupby(["week", "risk_level"])
+    .size()
+    .reset_index(name="days")
+)
+
+fig_heat = px.density_heatmap(
+    heatmap_df,
+    x="week",
+    y="risk_level",
+    z="days",
+    title="Weekly Health Risk Intensity"
+)
+
+st.plotly_chart(fig_heat, use_container_width=True)
+
+# ---------------- FOOTER ----------------
+st.sidebar.markdown("---")
+st.sidebar.caption("⏱ Live Simulation")
+st.sidebar.write(pd.Timestamp.now())
