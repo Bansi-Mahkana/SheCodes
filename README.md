@@ -1,2 +1,2 @@
-# Ingenious_7_0_SheCodes
+# SheCodes
 Repository for Ingenious Hackathon 7.0.
