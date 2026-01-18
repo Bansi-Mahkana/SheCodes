@@ -1,7 +1,6 @@
 import requests
-
-FIREBASE_API_KEY = "AIzaSyA7bzN17PSq8UlQz2xPsPy4BzwGLhqM8TE"
-
+import streamlit as st
+FIREBASE_API_KEY = st.secrets["FIREBASE_API_KEY"]
 
 def signup(email, password):
     url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
