@@ -1,119 +1,790 @@
+import pickle
 import streamlit as st
 import pandas as pd
-import pickle
+import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import sqlite3
+from datetime import datetime, timedelta
+import warnings
+from dashboard.prediction_dashboard import show_health_dashboard
 
-@st.cache_data
-def load_data():
-    weather = pd.read_csv("weather_data.csv")
-    health = pd.read_csv("health_data.csv")
-    traffic = pd.read_csv("traffic_data.csv")
+warnings.filterwarnings('ignore')
 
-    df = weather.merge(traffic, on=["date", "city"])
-    df = df.merge(health, on=["date", "city"])
-    return df
+# ----------------------------------
+# Page configuration
+# ----------------------------------
+st.set_page_config(
+    page_title="CityBAND - Health Intelligence Dashboard",
+    page_icon="🏥",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ----------------------------------
+# Custom CSS
+# ----------------------------------
+st.markdown("""
+<style>
+.main { background-color: #f5f7fa; }
+.stMetric {
+    background-color: white;
+    padding: 15px;
+    border-radius: 10px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+.risk-high {
+    background-color: #fee;
+    border-left: 5px solid #e74c3c;
+    padding: 10px;
+    border-radius: 5px;
+}
+.risk-medium {
+    background-color: #fef9e7;
+    border-left: 5px solid #f39c12;
+    padding: 10px;
+    border-radius: 5px;
+}
+.risk-low {
+    background-color: #eafaf1;
+    border-left: 5px solid #27ae60;
+    padding: 10px;
+    border-radius: 5px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ----------------------------------
+# DB + Model
+# ----------------------------------
+@st.cache_resource
+def get_connection():
+    return sqlite3.connect("database/final.db", check_same_thread=False)
 
 @st.cache_resource
-def load_model():
-    return pickle.load(open("model.pkl", "rb"))
+def load_health_model():
+    with open("models/health_risk_model.pkl", "rb") as f:
+        return pickle.load(f)
+
+# ----------------------------------
+# Data loading
+# ----------------------------------
+@st.cache_data(ttl=300)
+def load_data():
+    conn = get_connection()
+    query = """
+    SELECT 
+        h.date, h.city,
+        t.vehicle_count, t.avg_speed, t.congestion_level,
+        w.temperature, w.heat_index, w.humidity, w.rainfall, w.aqi,
+        w.air_quality_category,
+        h.respiratory_cases, h.heat_related_cases,
+        h.total_hospital_visits
+    FROM health_data h
+    LEFT JOIN traffic_data t ON h.date = t.date AND h.city = t.city
+    LEFT JOIN weather_data w ON h.date = w.date AND h.city = w.city
+    """
+
+    df = pd.read_sql_query(query, conn)
+    df['date'] = pd.to_datetime(df['date'])
+
+    # Calculate health risk score
+    df['health_risk_score'] = calculate_risk_score(df)
+    df['risk_category'] = df['health_risk_score'].apply(categorize_risk)
+
+    return df
+
+
+def calculate_risk_score(df):
+    # Normalize factors (0-100 scale)
+    aqi_norm = np.clip(df['aqi'] / 3, 0, 100)
+    temp_norm = np.clip((df['temperature'] - 25) * 2, 0, 100)
+    resp_norm = np.clip(df['respiratory_cases'] / df['respiratory_cases'].max() * 100, 0, 100)
+    heat_norm = np.clip(df['heat_related_cases'] / df['heat_related_cases'].max() * 100, 0, 100)
+
+    # Weighted risk score
+    risk_score = (
+        0.35 * aqi_norm +
+        0.25 * temp_norm +
+        0.25 * resp_norm +
+        0.15 * heat_norm
+    )
+
+    return risk_score
+
+
+def categorize_risk(score):
+    if score < 40:
+        return 'Low'
+    elif score < 70:
+        return 'Medium'
+    else:
+        return 'High'
+
 
 df = load_data()
-model = load_model()
+health_model = load_health_model()
 
-st.set_page_config(
-    page_title="Urban Health Intelligence",
-    layout="wide"
+# ----------------------------------
+# Sidebar Header
+# ----------------------------------
+st.sidebar.title("🏥 CityBAND")
+st.sidebar.markdown("### Data-Driven Health Analytics")
+
+# ----------------------------------
+# Navigation
+# ----------------------------------
+page = st.sidebar.radio(
+    "Navigation",
+    [
+        "🏠 Overview",
+        "📊 City Analysis",
+        "🗺️ Geographic Insights",
+        "🔮 What-If Scenarios",
+        "⚠️ Early Warning",
+        "🔮 7-Day Health Forecast"
+    ]
 )
 
-st.title("🌆 Urban Health Intelligence Dashboard")
-st.markdown("Predicting health risk using **Weather, Air Quality & Traffic Data**")
+# ----------------------------------
+# CONDITIONAL FILTERS (KEY FIX)
+# ----------------------------------
+if page != "🔮 7-Day Health Forecast":
 
-menu = st.sidebar.radio(
-    "Navigate",
-    ["Overview", "Insights", "ML Prediction", "Model Explainability"]
-)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Filters")
 
-if menu == "Overview":
-    st.subheader("📌 Dataset Snapshot")
-    st.dataframe(df.head())
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Avg AQI", round(df["aqi"].mean(), 2))
-    col2.metric("Avg Hospital Visits", round(df["total_hospital_visits"].mean(), 2))
-    col3.metric("Avg Vehicle Count", round(df["vehicle_count"].mean(), 2))
-
-if menu == "Insights":
-    st.subheader("🌫 Air Quality vs Respiratory Cases")
-
-    fig = px.scatter(
-        df,
-        x="aqi",
-        y="respiratory_cases",
-        color="city",
-        title="AQI Impact on Respiratory Health"
+    date_range = st.sidebar.date_input(
+        "Date Range",
+        value=(df["date"].min(), df["date"].max())
     )
-    st.plotly_chart(fig, use_container_width=True)
 
-    fig2 = px.scatter(
-        df,
-        x="vehicle_count",
-        y="total_hospital_visits",
-        color="congestion_level",
-        title="Traffic Congestion vs Hospital Visits"
+    cities = st.sidebar.multiselect(
+        "Select Cities",
+        sorted(df["city"].unique()),
+        default=sorted(df["city"].unique())
     )
-    st.plotly_chart(fig2, use_container_width=True)
 
-if menu == "ML Prediction":
-    st.subheader("🔮 Predict Urban Health Risk")
+    df_filtered = df[
+        (df["city"].isin(cities)) &
+        (df["date"].between(
+            pd.to_datetime(date_range[0]),
+            pd.to_datetime(date_range[1])
+        ))
+    ]
 
+else:
+    # 🚫 Forecast page ignores global filters
+    df_filtered = df
+
+# ----------------------------------
+# PAGES
+# ----------------------------------
+
+if page == "🏠 Overview":
+    st.title("🏥 CityBAND - Public Health Intelligence Dashboard")
+    st.markdown("### Real-time Urban Health Risk Monitoring & Analytics")
+
+    # Key Metrics
+    col1, col2, col3, col4 = st.columns(4)
+
+    latest_data = df_filtered.groupby('city').tail(1)
+
+    with col1:
+        avg_risk = latest_data['health_risk_score'].mean()
+        st.metric(
+            "Average Risk Score",
+            f"{avg_risk:.1f}",
+            delta=f"{avg_risk - df.groupby('city').tail(7)['health_risk_score'].mean():.1f}",
+            delta_color="inverse"
+        )
+
+    with col2:
+        high_risk_cities = (latest_data['risk_category'] == 'High').sum()
+        st.metric(
+            "High Risk Cities",
+            high_risk_cities,
+            delta=f"{high_risk_cities - (df.groupby('city').tail(7)['risk_category'] == 'High').sum()}"
+        )
+
+    with col3:
+        avg_aqi = latest_data['aqi'].mean()
+        st.metric(
+            "Average AQI",
+            f"{avg_aqi:.0f}",
+            delta=f"{avg_aqi - df.groupby('city').tail(7)['aqi'].mean():.0f}",
+            delta_color="inverse"
+        )
+
+    with col4:
+        total_cases = latest_data['respiratory_cases'].sum() + latest_data['heat_related_cases'].sum()
+        st.metric(
+            "Total Health Cases",
+            f"{total_cases:,}",
+            delta=f"{total_cases - (df.groupby('city').tail(7)['respiratory_cases'].sum() + df.groupby('city').tail(7)['heat_related_cases'].sum()):,}",
+            delta_color="inverse"
+        )
+
+    st.markdown("---")
+
+    # Risk Distribution
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.subheader("📈 Risk Score Trends")
+
+        daily_risk = df_filtered.groupby(['date', 'city'])['health_risk_score'].mean().reset_index()
+
+        fig = px.line(
+            daily_risk,
+            x='date',
+            y='health_risk_score',
+            color='city',
+            title='Health Risk Score Over Time',
+            labels={'health_risk_score': 'Risk Score', 'date': 'Date'}
+        )
+        fig.add_hline(y=40, line_dash="dash", line_color="green", annotation_text="Low Risk Threshold")
+        fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="High Risk Threshold")
+        fig.update_layout(height=400, hovermode='x unified')
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.subheader("🎯 Risk Distribution")
+
+        risk_counts = latest_data['risk_category'].value_counts()
+
+        fig = go.Figure(data=[go.Pie(
+            labels=risk_counts.index,
+            values=risk_counts.values,
+            hole=.4,
+            marker_colors=['#27ae60', '#f39c12', '#e74c3c']
+        )])
+        fig.update_layout(height=400, showlegend=True)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # City Rankings
+    st.subheader("🏙️ City Health Risk Rankings")
+
+    city_summary = latest_data[['city', 'health_risk_score', 'risk_category', 'aqi',
+                                  'temperature', 'respiratory_cases', 'heat_related_cases']].copy()
+    city_summary = city_summary.sort_values('health_risk_score', ascending=False)
+    city_summary['health_risk_score'] = city_summary['health_risk_score'].round(2)
+    city_summary.columns = ['City', 'Risk Score', 'Risk Level', 'AQI', 'Temperature',
+                             'Respiratory Cases', 'Heat Cases']
+
+    st.dataframe(city_summary, hide_index=True, use_container_width=True)
+
+
+elif page == "📊 City Analysis":
+    st.title("📊 Detailed City Analysis")
+    selected_city = st.selectbox("Select City for Analysis", sorted(df_filtered['city'].unique()))
+    city_data = df_filtered[df_filtered['city'] == selected_city].sort_values('date')
+
+    # City metrics
+    latest = city_data.iloc[-1]
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        st.metric("Risk Score", f"{latest['health_risk_score']:.1f}")
+    with col2:
+        st.metric("Risk Level", latest['risk_category'])
+    with col3:
+        st.metric("AQI", f"{latest['aqi']:.0f}")
+    with col4:
+        st.metric("Temperature", f"{latest['temperature']:.1f}°C")
+    with col5:
+        st.metric("Hospital Visits", f"{latest['total_hospital_visits']:,}")
+
+    st.markdown("---")
+
+    # Time series analysis
     col1, col2 = st.columns(2)
 
     with col1:
-        temp = st.slider("Temperature (°C)", 10, 45, 30)
-        humidity = st.slider("Humidity (%)", 20, 100, 60)
-        rainfall = st.slider("Rainfall (mm)", 0.0, 50.0, 0.0)
-        aqi = st.slider("AQI", 50, 300, 150)
+        st.subheader("Environmental Factors")
+
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=('Air Quality Index', 'Temperature & Heat Index'),
+            vertical_spacing=0.15
+        )
+
+        fig.add_trace(
+            go.Scatter(x=city_data['date'], y=city_data['aqi'], name='AQI',
+                      line=dict(color='#e74c3c')),
+            row=1, col=1
+        )
+
+        fig.add_trace(
+            go.Scatter(x=city_data['date'], y=city_data['temperature'],
+                      name='Temperature', line=dict(color='#f39c12')),
+            row=2, col=1
+        )
+
+        fig.add_trace(
+            go.Scatter(x=city_data['date'], y=city_data['heat_index'],
+                      name='Heat Index', line=dict(color='#e67e22', dash='dash')),
+            row=2, col=1
+        )
+
+        fig.update_xaxes(title_text="Date", row=2, col=1)
+        fig.update_yaxes(title_text="AQI", row=1, col=1)
+        fig.update_yaxes(title_text="Temperature (°C)", row=2, col=1)
+        fig.update_layout(height=500, showlegend=True, hovermode='x unified')
+
+        st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        heat_index = st.slider("Heat Index", 20, 60, 35)
-        vehicle_count = st.slider("Vehicle Count", 50, 500, 200)
-        avg_speed = st.slider("Avg Speed (km/h)", 5, 60, 30)
-        congestion = st.selectbox("Congestion Level", ["Low", "Medium", "High"])
+        st.subheader("Health Indicators")
 
-    congestion_map = {"Low": 0, "Medium": 1, "High": 2}
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=('Health Cases', 'Hospital Visits'),
+            vertical_spacing=0.15
+        )
 
-    input_data = [[
-        temp,
-        humidity,
-        rainfall,
-        aqi,
-        heat_index,
-        2,  # air quality category placeholder
-        0, 0, 0,  # health placeholders
-        vehicle_count,
-        avg_speed,
-        congestion_map[congestion],
-        aqi * heat_index,
-        vehicle_count / (avg_speed + 1),
-        temp * humidity
-    ]]
+        fig.add_trace(
+            go.Bar(x=city_data['date'], y=city_data['respiratory_cases'],
+                   name='Respiratory Cases', marker_color='#3498db'),
+            row=1, col=1
+        )
 
-    if st.button("Predict Health Risk"):
-        prediction = model.predict(input_data)
-        risk = ["Low", "Medium", "High"][prediction[0]]
+        fig.add_trace(
+            go.Bar(x=city_data['date'], y=city_data['heat_related_cases'],
+                   name='Heat Cases', marker_color='#e74c3c'),
+            row=1, col=1
+        )
 
-        st.success(f"🏥 Predicted Health Risk Level: **{risk}**")
+        fig.add_trace(
+            go.Scatter(x=city_data['date'], y=city_data['total_hospital_visits'],
+                      name='Total Visits', line=dict(color='#9b59b6')),
+            row=2, col=1
+        )
 
-if menu == "Model Explainability":
-    st.subheader("🧠 Model Feature Importance")
+        fig.update_xaxes(title_text="Date", row=2, col=1)
+        fig.update_yaxes(title_text="Cases", row=1, col=1)
+        fig.update_yaxes(title_text="Visits", row=2, col=1)
+        fig.update_layout(height=500, showlegend=True, barmode='stack', hovermode='x unified')
 
-    importances = model.feature_importances_
-    features = df.drop(["date", "city"], axis=1).columns
+        st.plotly_chart(fig, use_container_width=True)
 
-    fig = px.bar(
-        x=importances,
-        y=features,
-        orientation="h",
-        title="Factors Influencing Health Risk"
+    # Correlation analysis
+    st.subheader("📊 Factor Correlation Analysis")
+
+    correlation_data = city_data[['aqi', 'temperature', 'humidity', 'respiratory_cases',
+                                    'heat_related_cases', 'health_risk_score']].corr()
+
+    fig = px.imshow(
+        correlation_data,
+        text_auto='.2f',
+        aspect='auto',
+        color_continuous_scale='RdYlGn_r',
+        title=f'Correlation Matrix - {selected_city}'
     )
+    fig.update_layout(height=500)
     st.plotly_chart(fig, use_container_width=True)
+
+
+elif page == "🗺️ Geographic Insights":
+    st.title("🗺️ Geographic Insights")
+    # City coordinates (sample data)
+    city_coords = {
+        'Delhi': {'lat': 28.7041, 'lon': 77.1025},
+        'Ahmedabad': {'lat': 23.0225, 'lon': 72.5714},
+        'Mumbai': {'lat': 19.0760, 'lon': 72.8777},
+        'Bangalore': {'lat': 12.9716, 'lon': 77.5946},
+        'Chennai': {'lat': 13.0827, 'lon': 80.2707},
+        'Lucknow': {'lat': 26.8467, 'lon': 80.9462},
+        'Shimla': {'lat': 31.1048, 'lon': 77.1734},
+        'Hyderabad': {'lat': 17.3850, 'lon': 78.4867}
+    }
+
+    latest_data = df_filtered.groupby('city').tail(1).copy()
+    latest_data['lat'] = latest_data['city'].map(lambda x: city_coords.get(x, {}).get('lat', 0))
+    latest_data['lon'] = latest_data['city'].map(lambda x: city_coords.get(x, {}).get('lon', 0))
+
+    # Map visualization
+    st.subheader("🗺️ Interactive Risk Map")
+
+    fig = px.scatter_mapbox(
+        latest_data,
+        lat='lat',
+        lon='lon',
+        size='health_risk_score',
+        color='risk_category',
+        hover_name='city',
+        hover_data={
+            'health_risk_score': ':.2f',
+            'aqi': ':.0f',
+            'temperature': ':.1f',
+            'respiratory_cases': ':,',
+            'lat': False,
+            'lon': False
+        },
+        color_discrete_map={'Low': '#27ae60', 'Medium': '#f39c12', 'High': '#e74c3c'},
+        zoom=4,
+        height=600,
+        title='City Health Risk Distribution'
+    )
+
+    fig.update_layout(mapbox_style="open-street-map")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Regional comparison
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("City Comparison - AQI vs Risk Score")
+
+        fig = px.scatter(
+            latest_data,
+            x='aqi',
+            y='health_risk_score',
+            size='total_hospital_visits',
+            color='risk_category',
+            hover_name='city',
+            color_discrete_map={'Low': '#27ae60', 'Medium': '#f39c12', 'High': '#e74c3c'},
+            title='AQI Impact on Health Risk'
+        )
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.subheader("Temperature vs Heat Cases")
+
+        fig = px.scatter(
+            latest_data,
+            x='temperature',
+            y='heat_related_cases',
+            size='health_risk_score',
+            color='risk_category',
+            hover_name='city',
+            color_discrete_map={'Low': '#27ae60', 'Medium': '#f39c12', 'High': '#e74c3c'},
+            title='Temperature Impact on Heat Cases'
+        )
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+
+elif page == "🔮 What-If Scenarios":
+    st.title("🔮 What-If Scenarios")
+    st.markdown("### Simulate changes in environmental and health parameters")
+
+    selected_city = st.selectbox("Select City for Simulation", sorted(df_filtered['city'].unique()))
+
+    city_data = df_filtered[df_filtered['city'] == selected_city]
+    baseline = city_data.iloc[-1].copy()
+
+    st.markdown("---")
+    st.subheader("🎛️ Adjust Parameters")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        aqi_change = st.slider(
+            "AQI Change (%)",
+            min_value=-50,
+            max_value=100,
+            value=0,
+            step=5,
+            help="Simulate AQI increase or decrease"
+        )
+
+        temp_change = st.slider(
+            "Temperature Change (°C)",
+            min_value=-10.0,
+            max_value=10.0,
+            value=0.0,
+            step=0.5,
+            help="Simulate temperature change"
+        )
+
+    with col2:
+        resp_change = st.slider(
+            "Respiratory Cases Change (%)",
+            min_value=-50,
+            max_value=100,
+            value=0,
+            step=5,
+            help="Simulate change in respiratory cases"
+        )
+
+        heat_change = st.slider(
+            "Heat Cases Change (%)",
+            min_value=-50,
+            max_value=100,
+            value=0,
+            step=5,
+            help="Simulate change in heat-related cases"
+        )
+
+    with col3:
+        traffic_change = st.slider(
+            "Vehicle Count Change (%)",
+            min_value=-50,
+            max_value=100,
+            value=0,
+            step=5,
+            help="Simulate traffic volume change"
+        )
+
+        humidity_change = st.slider(
+            "Humidity Change (%)",
+            min_value=-30,
+            max_value=30,
+            value=0,
+            step=5,
+            help="Simulate humidity change"
+        )
+
+    # Calculate scenario
+    scenario = baseline.copy()
+    scenario['aqi'] = baseline['aqi'] * (1 + aqi_change / 100)
+    scenario['temperature'] = baseline['temperature'] + temp_change
+    scenario['respiratory_cases'] = baseline['respiratory_cases'] * (1 + resp_change / 100)
+    scenario['heat_related_cases'] = baseline['heat_related_cases'] * (1 + heat_change / 100)
+    scenario['vehicle_count'] = baseline['vehicle_count'] * (1 + traffic_change / 100)
+    scenario['humidity'] = np.clip(baseline['humidity'] + humidity_change, 0, 100)
+
+    # Recalculate risk score
+    scenario_df = pd.DataFrame([scenario])
+    scenario['health_risk_score'] = calculate_risk_score(scenario_df).iloc[0]
+    scenario['risk_category'] = categorize_risk(scenario['health_risk_score'])
+
+    st.markdown("---")
+    st.subheader("📊 Scenario Results")
+
+    # Comparison metrics
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        risk_delta = scenario['health_risk_score'] - baseline['health_risk_score']
+        st.metric(
+            "Risk Score",
+            f"{scenario['health_risk_score']:.1f}",
+            delta=f"{risk_delta:.1f}",
+            delta_color="inverse"
+        )
+
+    with col2:
+        st.metric(
+            "Risk Category",
+            scenario['risk_category'],
+            delta=None if scenario['risk_category'] == baseline['risk_category'] else "Changed"
+        )
+
+    with col3:
+        st.metric(
+            "AQI",
+            f"{scenario['aqi']:.0f}",
+            delta=f"{scenario['aqi'] - baseline['aqi']:.0f}",
+            delta_color="inverse"
+        )
+
+    with col4:
+        total_cases = scenario['respiratory_cases'] + scenario['heat_related_cases']
+        baseline_cases = baseline['respiratory_cases'] + baseline['heat_related_cases']
+        st.metric(
+            "Total Cases",
+            f"{total_cases:.0f}",
+            delta=f"{total_cases - baseline_cases:.0f}",
+            delta_color="inverse"
+        )
+
+    # Visualization
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Parameter Comparison")
+
+        comparison_data = pd.DataFrame({
+            'Parameter': ['AQI', 'Temperature', 'Respiratory Cases', 'Heat Cases', 'Vehicle Count'],
+            'Baseline': [
+                baseline['aqi'],
+                baseline['temperature'],
+                baseline['respiratory_cases'],
+                baseline['heat_related_cases'],
+                baseline['vehicle_count']
+            ],
+            'Scenario': [
+                scenario['aqi'],
+                scenario['temperature'],
+                scenario['respiratory_cases'],
+                scenario['heat_related_cases'],
+                scenario['vehicle_count']
+            ]
+        })
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name='Baseline', x=comparison_data['Parameter'],
+                            y=comparison_data['Baseline'], marker_color='#3498db'))
+        fig.add_trace(go.Bar(name='Scenario', x=comparison_data['Parameter'],
+                            y=comparison_data['Scenario'], marker_color='#e74c3c'))
+        fig.update_layout(barmode='group', height=400, title='Baseline vs Scenario')
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.subheader("Risk Score Impact")
+
+        risk_data = pd.DataFrame({
+            'Scenario': ['Baseline', 'Simulated'],
+            'Risk Score': [baseline['health_risk_score'], scenario['health_risk_score']],
+            'Category': [baseline['risk_category'], scenario['risk_category']]
+        })
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=risk_data['Scenario'],
+            y=risk_data['Risk Score'],
+            text=risk_data['Category'],
+            textposition='auto',
+            marker_color=['#3498db', '#e74c3c']
+        ))
+        fig.add_hline(y=40, line_dash="dash", line_color="green")
+        fig.add_hline(y=70, line_dash="dash", line_color="red")
+        fig.update_layout(height=400, title='Health Risk Score Comparison')
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Insights
+    st.markdown("---")
+    st.subheader("💡 Scenario Insights")
+
+    if risk_delta > 10:
+        st.error(f"⚠️ **High Risk Increase**: The simulated scenario shows a significant risk increase of {risk_delta:.1f} points. Immediate intervention may be required.")
+    elif risk_delta > 0:
+        st.warning(f"⚡ **Moderate Risk Increase**: Risk score increased by {risk_delta:.1f} points. Monitor the situation closely.")
+    elif risk_delta < -10:
+        st.success(f"✅ **Significant Improvement**: Risk score decreased by {abs(risk_delta):.1f} points. Positive impact expected.")
+    else:
+        st.info(f"📊 **Minimal Change**: Risk score changed by {risk_delta:.1f} points. Stable conditions.")
+
+
+elif page == "⚠️ Early Warning":
+    st.title("⚠️ Early Warning System")
+    st.markdown("### Real-time alerts and predictive indicators")
+
+    # Alert thresholds
+    latest_data = df_filtered.groupby('city').tail(1)
+
+    # Generate alerts
+    alerts = []
+
+    for _, row in latest_data.iterrows():
+        if row['health_risk_score'] > 70:
+            alerts.append({
+                'severity': 'High',
+                'city': row['city'],
+                'message': f"High health risk detected (Score: {row['health_risk_score']:.1f})",
+                'type': 'Risk Score'
+            })
+
+        if row['aqi'] > 250:
+            alerts.append({
+                'severity': 'High',
+                'city': row['city'],
+                'message': f"Hazardous air quality (AQI: {row['aqi']:.0f})",
+                'type': 'Air Quality'
+            })
+        elif row['aqi'] > 150:
+            alerts.append({
+                'severity': 'Medium',
+                'city': row['city'],
+                'message': f"Unhealthy air quality (AQI: {row['aqi']:.0f})",
+                'type': 'Air Quality'
+            })
+
+        if row['temperature'] > 38:
+            alerts.append({
+                'severity': 'High',
+                'city': row['city'],
+                'message': f"Extreme heat warning (Temperature: {row['temperature']:.1f}°C)",
+                'type': 'Temperature'
+            })
+
+        if row['respiratory_cases'] > latest_data['respiratory_cases'].quantile(0.75):
+            alerts.append({
+                'severity': 'Medium',
+                'city': row['city'],
+                'message': f"Elevated respiratory cases ({row['respiratory_cases']:.0f})",
+                'type': 'Health'
+            })
+
+    alerts_df = pd.DataFrame(alerts)
+
+    # Display alerts
+    if not alerts_df.empty:
+        st.subheader(f"🚨 Active Alerts ({len(alerts_df)})")
+
+        # Filter by severity
+        severity_filter = st.multiselect(
+            "Filter by Severity",
+            options=['High', 'Medium'],
+            default=['High', 'Medium']
+        )
+
+        filtered_alerts = alerts_df[alerts_df['severity'].isin(severity_filter)]
+
+        for _, alert in filtered_alerts.iterrows():
+            if alert['severity'] == 'High':
+                st.markdown(f"""
+                <div class="risk-high">
+                    <strong>🔴 {alert['city']}</strong> - {alert['type']}<br>
+                    {alert['message']}
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="risk-medium">
+                    <strong>🟡 {alert['city']}</strong> - {alert['type']}<br>
+                    {alert['message']}
+                </div>
+                """, unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
+    else:
+        st.success("✅ No active alerts. All cities within normal parameters.")
+
+    st.markdown("---")
+
+    # Recommended actions
+    st.markdown("---")
+    st.subheader("📋 Recommended Actions")
+
+    high_risk_cities = latest_data[latest_data['risk_category'] == 'High']['city'].tolist()
+
+    if high_risk_cities:
+        st.warning(f"**Cities Requiring Immediate Attention**: {', '.join(high_risk_cities)}")
+
+        st.markdown("""
+        **Recommended Interventions:**
+        - 🏥 Increase hospital preparedness and staff allocation
+        - 📢 Issue public health advisories for vulnerable populations
+        - 🚗 Implement traffic restrictions to reduce air pollution
+        - 🌡️ Activate cooling centers for heat-related emergencies
+        - 💊 Ensure adequate supply of respiratory medications
+        - 📊 Increase monitoring frequency
+        """)
+    else:
+        st.success("All cities are within acceptable risk levels. Continue routine monitoring.")
+
+
+elif page == "🔮 7-Day Health Forecast":
+    st.title("🔮 7-Day Health Risk Forecast (ML-Based)")
+    st.markdown("""
+    This module predicts **future AQI, temperature, rainfall, and health risk**
+    using **machine learning and time-series forecasting**.
+    """)
+
+    show_health_dashboard(df, health_model)
+
+
+# ----------------------------------
+# Footer
+# ----------------------------------
+st.markdown("---")
+st.markdown("""
+<div style="text-align:center;color:#7f8c8d;">
+CityBAND – Smart City Health Intelligence Platform
+</div>
+""", unsafe_allow_html=True)
