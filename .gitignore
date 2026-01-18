@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 *.db
+firebase-adminsdk-*.json
 .env
 .streamlit/
